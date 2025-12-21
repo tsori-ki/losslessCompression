@@ -1,26 +1,19 @@
 """
-Encoder.py - Lempel-Ziv encoder implementation
-Modified to send next byte after match instead of dummy byte
+Encoder.py - LZSS (Lempel-Ziv-Storer-Szymanski) implementation
+Optimized for binary files using Flag bits.
 """
 from Elias import delta_encode
 from typing import Tuple, List
+from tqdm import tqdm
 
 # Configuration
-WINDOW_SIZE = 4096  # Search window size
-LOOKAHEAD_SIZE = 1000  # Max match length
-MIN_MATCH_LENGTH = 3  # Minimum match length to encode
+WINDOW_SIZE = 4096      # Search window size (History)
+LOOKAHEAD_SIZE = 258    # Max match length (258 is common in Deflate/Zip)
+MIN_MATCH_LENGTH = 3    # Minimum match length to justify encoding overhead
 
 
 def read_file(filename: str) -> bytes:
-    """
-    Read binary file and return its contents as bytes.
-
-    Args:
-        filename: Path to the file to read
-
-    Returns:
-        bytes: File contents
-    """
+    """Read binary file and return its contents as bytes."""
     with open(filename, 'rb') as f:
         return f.read()
 
@@ -28,117 +21,103 @@ def read_file(filename: str) -> bytes:
 def find_longest_match(data: bytes, i: int) -> Tuple[int, int]:
     """
     Find the longest match in the sliding window before position i.
-
-    Args:
-        data: The complete data
-        i: Current position in data
-
-    Returns:
-        (j, l): where j is the offset (distance back), l is match length
-                Returns (0, 0) if no match found
+    Returns: (offset, length)
     """
     # Define the search window
     window_start = max(0, i - WINDOW_SIZE)
+    # Don't look past the end of data
     lookahead_end = min(len(data), i + LOOKAHEAD_SIZE)
 
-    best_offset = 0  # j - distance back
-    best_length = 0  # l - match length
+    best_offset = 0
+    best_length = 0
 
-    # Search through the window for matches
-    for search_pos in range(window_start, i):
-        # Count how many consecutive bytes match
+    # Search backwards from i-1 down to window_start
+    # (Searching backwards is often heuristic to find closer matches first)
+    for search_pos in range(i - 1, window_start - 1, -1):
+
+        # Optimization: Quick check if first byte matches
+        if data[search_pos] != data[i]:
+            continue
+
         match_length = 0
-
         while (i + match_length < lookahead_end and
-               data[search_pos + match_length] == data[i + match_length] and
-               match_length < LOOKAHEAD_SIZE):
+               data[search_pos + match_length] == data[i + match_length]):
             match_length += 1
+            if match_length >= LOOKAHEAD_SIZE:
+                break
 
-        # Update best match if this one is longer
         if match_length > best_length:
             best_length = match_length
-            best_offset = i - search_pos  # Distance back
+            best_offset = i - search_pos
+
+            # Optimization: If we found a very long match, stop searching
+            if best_length >= 128:
+                break
 
     return best_offset, best_length
 
 
-def encode(data: bytes, i: int) -> Tuple[int, int, List[int]]:
+def encode_token(data: bytes, i: int) -> Tuple[int, List[int]]:
     """
-    Encode one token (match or literal) starting at position i.
-    Format: [j][l][byte] where:
-    - If l=0: it's a literal, byte contains the literal value
-    - If l>0: it's a match, byte contains the next byte after the match
+    Encode one LZSS token starting at position i.
 
-    Args:
-        data: Complete file data
-        i: Current position in data
+    Logic:
+    1. Try to find a match.
+    2. If match length >= MIN_MATCH_LENGTH:
+       Output: [1] + [Elias(length)] + [Elias(offset)]
+    3. Else:
+       Output: [0] + [8-bit literal]
 
     Returns:
-        (j, l, bits):
-            j: offset (distance back to match), 0 if literal
-            l: length of match, 0 if literal
-            bits: encoded bits for this token
+        (advance_by, bits): number of bytes consumed, and the bit list.
     """
-    # Check if we're at end of data
+    # Check for End of File
     if i >= len(data):
-        return 0, 0, []
+        return 0, []
 
-    # Find longest match in the window
-    j, l = find_longest_match(data, i)
+    # 1. Attempt to find a match
+    offset, length = find_longest_match(data, i)
 
     bits = []
 
-    # Decide whether to encode as match or literal
-    if l >= MIN_MATCH_LENGTH:
-        # Encode as MATCH token: [offset j][length l][next byte after match]
-        bits.extend(delta_encode(j))  # Encode offset
-        bits.extend(delta_encode(l))  # Encode length
+    # 2. Decide: Match or Literal?
+    if length >= MIN_MATCH_LENGTH:
+        # --- MATCH CASE ---
+        # Flag '1' indicates a Match follows
+        bits.append(1)
 
-        # Encode the byte AFTER the match (or 0 if we're at end of data)
-        next_byte_pos = i + l
-        if next_byte_pos < len(data):
-            byte_val = data[next_byte_pos]
-            # Advance by l+1 to skip the match AND the next byte
-            advance_by = l + 1
-        else:
-            # We're at the end, encode a null byte
-            byte_val = 0
-            # Only advance by l since there's no next byte
-            advance_by = l
+        # Encode Length (using Elias Delta)
+        # Note: We encode 'length' directly.
+        # (Some variants encode 'length - MIN_MATCH_LENGTH' to save bits,
+        # but pure Elias on 'length' is safer for now).
+        bits.extend(delta_encode(length))
+
+        # Encode Offset (using Elias Delta)
+        bits.extend(delta_encode(offset))
+
+        return length, bits
+
+    else:
+        # --- LITERAL CASE ---
+        # Flag '0' indicates a Literal follows
+        bits.append(0)
 
         # Encode the byte as 8 bits
-        for bit_pos in range(7, -1, -1):
-            bits.append((byte_val >> bit_pos) & 1)
-
-        return j, advance_by, bits
-    else:
-        # Encode as LITERAL token: [j=0][l=0][8-bit byte value]
-        bits.extend(delta_encode(1))  # j=0 encoded as delta(1) since delta needs n>0
-        bits.extend(delta_encode(1))  # l=0 encoded as delta(1) since delta needs n>0
-
-        # Encode the actual byte value as 8 bits
         byte_val = data[i]
         for bit_pos in range(7, -1, -1):
             bits.append((byte_val >> bit_pos) & 1)
 
-        return 0, 1, bits  # j=0, l=1 to advance by 1 byte
+        return 1, bits
 
 
 def bits_to_bytes(bits: List[int]) -> bytes:
-    """
-    Convert a list of bits to bytes, padding the final byte with zeros if needed.
-    No padding metadata is stored; callers must track the meaningful bit-length.
-
-    Args:
-        bits: List of bits (0s and 1s)
-
-    Returns:
-        bytes: Packed bytes containing the provided bits with zero padding at the end.
-    """
-    if len(bits) == 0:
+    """Convert bit list to bytes, padding the end with zeros."""
+    if not bits:
         return b""
 
     padding_needed = (8 - len(bits) % 8) % 8
+    # We don't store padding size here because the Decoder
+    # will stop based on 'token_count', ignoring trailing padding.
     bits_padded = bits + [0] * padding_needed
 
     byte_array = bytearray()
@@ -151,72 +130,47 @@ def bits_to_bytes(bits: List[int]) -> bytes:
     return bytes(byte_array)
 
 
+
 def encoder(filename: str, output_filename: str = None) -> int:
-    """
-    Main encoder function. Reads file, encodes it using LZ77, and writes output.
-    Now sends token count first instead of padding.
-
-    Args:
-        filename: Input file to compress
-        output_filename: Output compressed file (default: filename + '.compressed')
-
-    Returns:
-        int: Compressed file size in bytes
-    """
-    # Read the input file
     data = read_file(filename)
     original_size = len(data)
 
-    print(f"Original size: {original_size} bytes")
+    print(f"\n=== Encoding: {filename} ===")
+    print(f"Original size: {original_size:,} bytes")
 
-    # First pass: encode everything and count tokens
     all_tokens = []
     i = 0
 
-    while i < len(data):
-        j, l, bits = encode(data, i)
-        all_tokens.append(bits)
-        i += l
+    with tqdm(total=len(data), unit='B', unit_scale=True, desc='Encoding') as pbar:
+        while i < len(data):
+            advance_by, bits = encode_token(data, i)
+            all_tokens.append(bits)
+            i += advance_by
+            pbar.update(advance_by)
 
-        if i % 10000 == 0:
-            progress = (i / len(data)) * 100
-            print(f"Progress: {progress:.1f}% ({i}/{len(data)} bytes)")
-
-    # Now we know the token count
     token_count = len(all_tokens)
-    print(f"Total tokens: {token_count}")
+    print(f"Tokens generated: {token_count:,}")
 
-    # Build final bit stream
     all_bits = []
-
-    # 1. Send token count (delta encoded, +1 because delta needs n > 0)
-    all_bits.extend(delta_encode(token_count + 1))
-
-    # 2. Send all token bits
+    all_bits.extend(delta_encode(token_count))
     for token_bits in all_tokens:
         all_bits.extend(token_bits)
 
-    # Convert bits to bytes
     compressed_data = bits_to_bytes(all_bits)
 
-    # Determine output filename
     if output_filename is None:
         output_filename = filename + '.compressed'
 
-    # Write compressed data to file
     with open(output_filename, 'wb') as f:
         f.write(compressed_data)
 
     compressed_size = len(compressed_data)
     compression_ratio = (compressed_size / original_size) * 100
 
-    print(f"Compressed size: {compressed_size} bytes")
+    print(f"Compressed size: {compressed_size:,} bytes")
     print(f"Compression ratio: {compression_ratio:.2f}%")
-    print(f"Saved: {original_size - compressed_size} bytes")
+    print(f"Bytes saved: {original_size - compressed_size:,}")
+    print(f"Output file: {output_filename}")
+    print("=" * 40 + "\n")
 
     return compressed_size
-
-
-# Example usage
-if __name__ == "__main__":
-    encoder("Samp4.bin", "dd.bin")
