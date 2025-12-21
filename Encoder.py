@@ -57,76 +57,100 @@ def bits_to_bytes(bits: List[int]) -> bytes:
 
 
 def encoder(filename: str, output_filename: str = None) -> int:
+    """
+    Smart Encoder: Tries to compress using LZSS+Huffman.
+    If compression fails to reduce size, falls back to 'Raw Mode'.
+    """
     data = read_file(filename)
     original_size = len(data)
-    print(f"Compressing {filename} ({original_size} bytes)")
+    print(f"Compressing {filename}\nOriginal size: {original_size} bytes")
 
-    # --- PASS 1: LZSS Logic & Frequency Analysis ---
-    # We store tokens as tuples:
-    #   ('L', byte_val)        -> Literal
-    #   ('M', length, offset)  -> Match
-
+    # --- Pass 1: LZSS Analysis (in memory) ---
     tokens = []
     literal_freqs = defaultdict(int)
     i = 0
 
-    with tqdm(total=len(data), desc='Analyzing (LZSS Pass 1)') as pbar:
+    # We use tqdm here to show progress during the heavy lifting
+    with tqdm(total=len(data), unit='B', unit_scale=True, desc='Encoding') as pbar:
         while i < len(data):
             offset, length = find_longest_match(data, i)
 
             if length >= MIN_MATCH_LENGTH:
-                # Decide: MATCH
+                # MATCH Found
                 tokens.append(('M', length, offset))
                 i += length
                 pbar.update(length)
             else:
-                # Decide: LITERAL
+                # LITERAL
                 byte_val = data[i]
                 tokens.append(('L', byte_val))
                 literal_freqs[byte_val] += 1
                 i += 1
                 pbar.update(1)
 
-    # --- BUILD HUFFMAN TREE ---
-    print(f"Building Huffman Tree for {len(literal_freqs)} unique literals...")
-    # If no literals (rare), add a dummy to prevent errors
-    if not literal_freqs:
-        literal_freqs[0] = 1
+    token_count = len(tokens)
+    print(f"Done encoding, total tokens: {token_count}")
+
+    # --- Build Huffman Tree ---
+    # Create a dummy entry if file was empty or only matches
+    if not literal_freqs: literal_freqs[0] = 1
 
     huff_root = build_huffman_tree_from_freqs(literal_freqs)
     huff_codes = generate_huffman_codes(huff_root)
 
-    # --- PASS 2: Encode Data ---
+    # --- Pass 2: Generate Bitstream ---
+    # We construct the compressed data in memory to check its size
     all_bits = []
 
-    # 1. Header: Total Token Count (Elias)
-    all_bits.extend(delta_encode(len(tokens)))
+    # Header: Token Count
+    all_bits.extend(delta_encode(token_count))
 
-    # 2. Header: Huffman Tree Structure
-    tree_bits = encode_tree_structure(huff_root)
-    all_bits.extend(tree_bits)
+    # Header: Huffman Tree Structure
+    all_bits.extend(encode_tree_structure(huff_root))
 
-    # 3. Payload: The Tokens
-    print("Encoding bitstream...")
+    # Payload: Tokens
     for token in tokens:
         if token[0] == 'L':
-            # Format: [0] + [Huffman Code]
+            # Literal: Flag 0 + Huffman Code
             all_bits.append(0)
             all_bits.extend(huff_codes[token[1]])
         else:
-            # Format: [1] + [Elias Length] + [Elias Offset]
+            # Match: Flag 1 + Elias Length + Elias Offset
             all_bits.append(1)
-            all_bits.extend(delta_encode(token[1]))  # length
-            all_bits.extend(delta_encode(token[2]))  # offset
+            all_bits.extend(delta_encode(token[1]))
+            all_bits.extend(delta_encode(token[2]))
 
-    # Write to file
-    compressed_data = bits_to_bytes(all_bits)
+    compressed_body = bits_to_bytes(all_bits)
+
+    # --- Safety Check: Store Mode vs Deflate Mode ---
+    final_output = bytearray()
+
+    # Logic: 1 byte for Mode + compressed body vs Original
+    if len(compressed_body) + 1 < original_size:
+        # Mode 1: Compressed (Deflate)
+        print("Compression successful. Using Deflate mode.")
+        final_output.append(1)
+        final_output.extend(compressed_body)
+    else:
+        # Mode 0: Raw (Fallback)
+        print("Compression inefficient. Fallback to Raw Mode.")
+        final_output.append(0)
+        final_output.extend(data)
+
+    # Write to File
     if output_filename is None:
         output_filename = filename + '.compressed'
 
     with open(output_filename, 'wb') as f:
-        f.write(compressed_data)
+        f.write(final_output)
 
-    print(f"Saved to {output_filename}")
-    print(f"Size: {len(compressed_data)} bytes (Ratio: {len(compressed_data) / original_size:.2%})")
-    return len(compressed_data)
+    final_size = len(final_output)
+    compression_ratio = (final_size / original_size) * 100
+
+    print(f"Compressed size: {final_size} bytes")
+    print(f"Compression ratio: {compression_ratio:.2f}%")
+    print(f"Saved: {original_size - final_size} bytes")
+    print(f"Output written to: {output_filename}")
+    print(f"__________________________________")
+
+    return final_size
